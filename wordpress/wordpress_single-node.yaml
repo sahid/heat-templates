@@ -51,10 +51,6 @@ parameters:
     type: string
     description: Configures a MySQL database name for WordPress.
     default: wordpress_db
-  mysql_host:
-    type: string
-    description: Configures a MySQL server host.
-    default: localhost
 
 resources:
   secgroup-http:
@@ -79,7 +75,6 @@ resources:
             "%mysql_user%": { get_param: mysql_user }
             "%mysql_user_password%": { get_param: mysql_user_password }
             "%mysql_database": { get_param: mysql_database }
-            "%mysql_host": { get_param: mysql_host }
           template: |
             #!/bin/bash
 
@@ -103,7 +98,7 @@ resources:
             define('DB_NAME', '%mysql_database%');
             define('DB_USER', '%mysql_user%');
             define('DB_PASSWORD', '%mysql_user_password%');
-            define('DB_HOST', '%mysql_host%');
+            define('DB_HOST', 'localhost');
             define('DB_CHARSET', 'utf8');
             define('DB_COLLATE', '');
             if ( !defined('ABSPATH') )
@@ -118,8 +113,7 @@ resources:
             apt-get -q -y install mysql-server
             mysql -e "UPDATE mysql.user SET Password=PASSWORD('%mysql_password%') WHERE User='root'; FLUSH PRIVILEGES"
             mysql -p%mysql_password% -e "CREATE DATABASE %mysql_database%"
-            mysql -p%mysql_password% -e "GRANT ALL PRIVILEGES ON %mysql_database%.* TO '%mysql_user%'@'%mysql_host%' IDENTIFIED BY '%mysql_user_password%'; FLUSH PRIVILEGES"
-            sed -i 's/127.0.0.1/%mysql_host%/g' /etc/mysql/my.cnf
+            mysql -p%mysql_password% -e "GRANT ALL PRIVILEGES ON %mysql_database%.* TO '%mysql_user%'@'localhost' IDENTIFIED BY '%mysql_user_password%'; FLUSH PRIVILEGES"
 
             echo "Configuring Apache..."
             echo "#####################"
