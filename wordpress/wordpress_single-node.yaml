@@ -1,0 +1,135 @@
+#   Copyright 2013 Cloudwatt 
+#   
+#   Author: Sahid Orentino Ferdjaoui <sahid.ferdjaoui@cloudwatt.com>
+#
+#   Licensed under the Apache License, Version 2.0 (the "License"); you may
+#   not use this file except in compliance with the License. You may obtain
+#   a copy of the License at
+#
+#        http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#   WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+#   License for the specific language governing permissions and limitations
+#   under the License.
+#
+
+heat_template_version: 2013-11-28
+
+description: >-
+  Setup a WordPress in standalone mode in a single node.
+  Note:
+    This template is used with deb packages.
+
+parameters:
+  key_name:
+    type: string
+    description: Name of a KeyPair to enable SSH access to the instance.
+  instance_type:
+    type: string
+    description: Instance type for WordPress server.
+    default: m2.medium
+  image_id:
+    type: string
+    description: ID of the image to use for the WordPress server.
+    default: Ubuntu 12.04.3 x86_64
+
+  mysql_password:
+    type: string
+    description: Configures a root password of MySQL.
+    default: Cl0udWatt
+  mysql_user:
+    type: string
+    description: Configures a MySQL user for WordPress.
+    default: wordpress_user
+  mysql_user_password:
+    type: string
+    description: Configures a MySQL password user for WordPress.
+    default: Cl0udWatt+User
+  mysql_database:
+    type: string
+    description: Configures a MySQL database name for WordPress.
+    default: wordpress_db
+  mysql_host:
+    type: string
+    description: Configures a MySQL server host.
+    default: localhost
+
+resources:
+  app:
+    type: OS::Nova::Server
+    properties:
+      image: { get_param: image_id }
+      flavor: { get_param: instance_type }
+      key_name: { get_param: key_name }
+      user_data_format: RAW
+      user_data:
+        str_replace:
+          params:
+            "%mysql_password%": { get_param: mysql_password }
+            "%mysql_user%": { get_param: mysql_user }
+            "%mysql_user_password%": { get_param: mysql_user_password }
+            "%mysql_database": { get_param: mysql_database }
+            "%mysql_host": { get_param: mysql_host }
+          template: |
+            #!/bin/bash
+
+            echo "Preparing the instance to be ready to run with Heat..."
+            echo "######################################################"
+            echo ""
+            apt-get update; apt-get install -y git python-setuptools
+            apt-get -y install python-argparse cloud-init python-psutil python-pip
+            apt-get -y remove python-boto
+            pip install 'boto==2.5.2' heat-cfntools
+            cfn-create-aws-symlinks -s /usr/local/bin/
+
+            echo "Installing and configuring WordPress..."
+            echo "#######################################"
+            echo ""
+            apt-get install -y wordpress
+            chown -R www-data /usr/share/wordpress
+            ln -s /usr/share/wordpress /var/www/wordpress
+            cat > /etc/wordpress/wp-config.php <<EOF
+            <?php
+            define('DB_NAME', '%mysql_database%');
+            define('DB_USER', '%mysql_user%');
+            define('DB_PASSWORD', '%mysql_user_password%');
+            define('DB_HOST', '%mysql_host%');
+            define('DB_CHARSET', 'utf8');
+            define('DB_COLLATE', '');
+            if ( !defined('ABSPATH') )
+            define('ABSPATH', dirname(__FILE__) . '/');
+              require_once(ABSPATH . 'wp-settings.php');
+            EOF
+
+            echo "Installing and configuring MySQL..."
+            echo "###################################"
+            echo ""
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get -q -y install mysql-server
+            mysql -e "UPDATE mysql.user SET Password=PASSWORD('%mysql_password%') WHERE User='root'; FLUSH PRIVILEGES"
+            mysql -p%mysql_password% -e "CREATE DATABASE %mysql_database%"
+            mysql -p%mysql_password% -e "GRANT ALL PRIVILEGES ON %mysql_database%.* TO '%mysql_user%'@'%mysql_host%' IDENTIFIED BY '%mysql_user_password%'; FLUSH PRIVILEGES"
+            sed -i 's/127.0.0.1/%mysql_host%/g' /etc/mysql/my.cnf
+
+            echo "Configuring Apache..."
+            echo "#####################"
+            echo ""
+            cat > /etc/apache2/sites-available/wordpress <<EOF
+            <VirtualHost *:80>
+            ServerName wordpress
+            ServerAdmin server@admin
+            DocumentRoot /var/www/wordpress/
+            <Directory />
+            Options FollowSymLinks
+            AllowOverride All
+            </Directory>
+            ErrorLog /var/log/apache2/error.log
+            CustomLog /var/log/apache2/access.log combined
+            LogLevel warn
+            </VirtualHost>
+            EOF
+            a2dissite default
+            a2ensite wordpress
+            service apache2 reload
