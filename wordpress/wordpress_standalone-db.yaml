@@ -15,7 +15,7 @@
 #   under the License.
 #
 
-heat_template_version: 2013-11-28
+heat_template_version: 2013-11-29
 
 description: >-
   Setup a WordPress in standalone database.
@@ -37,7 +37,7 @@ parameters:
   public_net_id:
     type: string
     description: Public network for which floating IP addresses will be allocated.
-    default: internet
+    default: 17ef688d-d903-48d5-8ddc-b8a8ae213346
 
   mysql_password:
     type: string
@@ -46,6 +46,7 @@ parameters:
   mysql_user:
     type: string
     description: Configures a MySQL user for WordPress.
+
     default: wordpress_user
   mysql_user_password:
     type: string
@@ -65,7 +66,7 @@ resources:
     type: OS::Neutron::SecurityGroup
     properties:
       description: Enable traffic external traffic on HTTP-80
-      rules: [{protocol: tcp, port_range_max: 80, port_range_min: 80},]
+      rules: [{protocol: tcp, port_range_max: 65535, port_range_min: 1},]
 
   secgroup-ssh:
     type: OS::Neutron::SecurityGroup
@@ -77,7 +78,7 @@ resources:
     type: OS::Neutron::SecurityGroup
     properties:
       description: Enable all traffic between instances.
-      rules: [{protocol: tcp, port_range_max: 65535, port_range_min: 1, remote_mode: remote_group_id}]
+      rules: [{protocol: tcp, port_range_max: 65535, port_range_min: 1, remote_mode: remote_group_id},]
 
 # Networks
 
@@ -112,6 +113,7 @@ resources:
   database_port:
     type: OS::Neutron::Port
     properties:
+      security_groups: [{get_resource: secgroup-ssh}, {get_resource: secgroup-internal}]
       network_id: { get_resource: private_net }
       fixed_ips:
         - subnet_id: { get_resource: private_subnet }
@@ -119,16 +121,18 @@ resources:
   appserver_port:
     type: OS::Neutron::Port
     properties:
+      security_groups: [{get_resource: secgroup-http}, {get_resource: secgroup-ssh}, {get_resource: secgroup-internal}]
       network_id: { get_resource: private_net }
       fixed_ips:
         - subnet_id: { get_resource: private_subnet }
 
 # Floating iP
-#  appserver_floating_ip:
-#    type: OS::Neutron::FloatingIP
-#    properties:
-#      floating_network_id: { get_param: public_net_id }
-#      port_id: { get_resource: appserver_port }
+
+  appserver_floating_ip:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network_id: { get_param: public_net_id }
+      port_id: { get_resource: appserver_port }
 
 # Servers
           
@@ -138,7 +142,6 @@ resources:
       image: { get_param: image_id }
       flavor: { get_param: instance_type }
       key_name: { get_param: key_name }
-      security_groups: [{get_resource: secgroup-ssh}, {get_resource: secgroup-internal}]
       networks:
         - port: { get_resource: database_port }
       user_data_format: RAW
@@ -148,8 +151,8 @@ resources:
             "%mysql_password%": { get_param: mysql_password }
             "%mysql_user%": { get_param: mysql_user }
             "%mysql_user_password%": { get_param: mysql_user_password }
-            "%mysql_database": { get_param: mysql_database }
-            "%mysql_host": { get_param: mysql_host }
+            "%mysql_database%": { get_param: mysql_database }
+            "%mysql_host%": { get_param: mysql_host }
           template: |
             #!/bin/bash
 
@@ -169,8 +172,9 @@ resources:
             apt-get -q -y install mysql-server
             mysql -e "UPDATE mysql.user SET Password=PASSWORD('%mysql_password%') WHERE User='root'; FLUSH PRIVILEGES"
             mysql -p%mysql_password% -e "CREATE DATABASE %mysql_database%"
-            mysql -p%mysql_password% -e "GRANT ALL PRIVILEGES ON %mysql_database%.* TO '%mysql_user%'@'%mysql_host%' IDENTIFIED BY '%mysql_user_password%'; FLUSH PRIVILEGES"
+            mysql -p%mysql_password% -e "GRANT ALL PRIVILEGES ON %mysql_database%.* TO '%mysql_user%' IDENTIFIED BY '%mysql_user_password%'; FLUSH PRIVILEGES"
             sed -i 's/127.0.0.1/%mysql_host%/g' /etc/mysql/my.cnf
+            service mysql restart
 
   appserver:
     type: OS::Nova::Server
@@ -178,7 +182,6 @@ resources:
       image: { get_param: image_id }
       flavor: { get_param: instance_type }
       key_name: { get_param: key_name }
-      security_groups: [{get_resource: secgroup-http}, {get_resource: secgroup-ssh}, {get_resource: secgroup-internal}]
       networks:
         - port: { get_resource: appserver_port }
       user_data_format: RAW
@@ -188,8 +191,8 @@ resources:
             "%mysql_password%": { get_param: mysql_password }
             "%mysql_user%": { get_param: mysql_user }
             "%mysql_user_password%": { get_param: mysql_user_password }
-            "%mysql_database": { get_param: mysql_database }
-            "%mysql_host": { get_attr: [ database, first_address ] }
+            "%mysql_database%": { get_param: mysql_database }
+            "%mysql_host%": { get_attr: [ database, first_address ] }
           template: |
             #!/bin/bash
 
