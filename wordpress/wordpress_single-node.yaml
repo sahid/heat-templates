@@ -79,7 +79,7 @@ resources:
             "%mysql_password%": { get_param: mysql_password }
             "%mysql_user%": { get_param: mysql_user }
             "%mysql_user_password%": { get_param: mysql_user_password }
-            "%mysql_database": { get_param: mysql_database }
+            "%mysql_database%": { get_param: mysql_database }
           template: |
             #!/bin/bash
 
