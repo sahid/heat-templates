@@ -18,7 +18,7 @@
 heat_template_version: 2013-11-28
 
 description: >-
-  Setup a WordPress in standalone mode in a single node.
+  Setup a WordPress in standalone database.
   Note:
     This template is used with deb packages.
 
@@ -34,6 +34,10 @@ parameters:
     type: string
     description: ID of the image to use for the WordPress server.
     default: Ubuntu 12.04.3 x86_64
+  public_net_id:
+    type: string
+    description: Public network for which floating IP addresses will be allocated.
+    default: internet
 
   mysql_password:
     type: string
@@ -51,27 +55,92 @@ parameters:
     type: string
     description: Configures a MySQL database name for WordPress.
     default: wordpress_db
+  mysql_host:
+    type: string
+    description: Configures a MySQL server host.
+    default: 0.0.0.0
 
 resources:
   secgroup-http:
     type: OS::Neutron::SecurityGroup
     properties:
-      description: Enable HTTP-80 and SSH traffic.
-      rules: [{protocol: tcp, port_range_max: 22, port_range_min: 22}, {protocol: tcp, port_range_max: 80, port_range_min: 80}]
+      description: Enable traffic external traffic on HTTP-80
+      rules: [{protocol: tcp, port_range_max: 80, port_range_min: 80},]
 
-  secgroup-egress:
+  secgroup-ssh:
     type: OS::Neutron::SecurityGroup
     properties:
-      description: Enable all outgoing traffic.
-      rules: [{direction: egress},]
+      description: Enable traffic external traffic on SSH.
+      rules: [{protocol: tcp, port_range_max: 22, port_range_min: 22},]
 
-  appserver:
+  secgroup-internal:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      description: Enable all traffic between instances.
+      rules: [{protocol: tcp, port_range_max: 65535, port_range_min: 1, remote_mode: remote_group_id}]
+
+# Networks
+
+  private_net:
+    type: OS::Neutron::Net
+
+  private_subnet:
+    type: OS::Neutron::Subnet
+    properties:
+      network_id: { get_resource: private_net }
+      cidr: 10.123.0.0/24
+
+# Router
+
+  router:
+    type: OS::Neutron::Router
+
+  router_gateway:
+    type: OS::Neutron::RouterGateway
+    properties:
+      router_id: { get_resource: router }
+      network_id: { get_param: public_net_id }
+
+  router_interface:
+    type: OS::Neutron::RouterInterface
+    properties:
+      router_id: { get_resource: router }
+      subnet_id: { get_resource: private_subnet }
+
+# Ports
+
+  database_port:
+    type: OS::Neutron::Port
+    properties:
+      network_id: { get_resource: private_net }
+      fixed_ips:
+        - subnet_id: { get_resource: private_subnet }
+
+  appserver_port:
+    type: OS::Neutron::Port
+    properties:
+      network_id: { get_resource: private_net }
+      fixed_ips:
+        - subnet_id: { get_resource: private_subnet }
+
+# Floating iP
+#  appserver_floating_ip:
+#    type: OS::Neutron::FloatingIP
+#    properties:
+#      floating_network_id: { get_param: public_net_id }
+#      port_id: { get_resource: appserver_port }
+
+# Servers
+          
+  database:
     type: OS::Nova::Server
     properties:
       image: { get_param: image_id }
       flavor: { get_param: instance_type }
       key_name: { get_param: key_name }
-      security_groups: [{get_resource: secgroup-egress}, {get_resource: secgroup-http},]
+      security_groups: [{get_resource: secgroup-ssh}, {get_resource: secgroup-internal}]
+      networks:
+        - port: { get_resource: database_port }
       user_data_format: RAW
       user_data:
         str_replace:
@@ -80,6 +149,47 @@ resources:
             "%mysql_user%": { get_param: mysql_user }
             "%mysql_user_password%": { get_param: mysql_user_password }
             "%mysql_database": { get_param: mysql_database }
+            "%mysql_host": { get_param: mysql_host }
+          template: |
+            #!/bin/bash
+
+            echo "Preparing the instance to be ready to run with Heat..."
+            echo "######################################################"
+            echo ""
+            apt-get update; apt-get install -y git python-setuptools
+            apt-get -y install python-argparse cloud-init python-psutil python-pip
+            apt-get -y remove python-boto
+            pip install 'boto==2.5.2' heat-cfntools
+            cfn-create-aws-symlinks -s /usr/local/bin/
+
+            echo "Installing and configuring MySQL..."
+            echo "###################################"
+            echo ""
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get -q -y install mysql-server
+            mysql -e "UPDATE mysql.user SET Password=PASSWORD('%mysql_password%') WHERE User='root'; FLUSH PRIVILEGES"
+            mysql -p%mysql_password% -e "CREATE DATABASE %mysql_database%"
+            mysql -p%mysql_password% -e "GRANT ALL PRIVILEGES ON %mysql_database%.* TO '%mysql_user%'@'%mysql_host%' IDENTIFIED BY '%mysql_user_password%'; FLUSH PRIVILEGES"
+            sed -i 's/127.0.0.1/%mysql_host%/g' /etc/mysql/my.cnf
+
+  appserver:
+    type: OS::Nova::Server
+    properties:
+      image: { get_param: image_id }
+      flavor: { get_param: instance_type }
+      key_name: { get_param: key_name }
+      security_groups: [{get_resource: secgroup-http}, {get_resource: secgroup-ssh}, {get_resource: secgroup-internal}]
+      networks:
+        - port: { get_resource: appserver_port }
+      user_data_format: RAW
+      user_data:
+        str_replace:
+          params:
+            "%mysql_password%": { get_param: mysql_password }
+            "%mysql_user%": { get_param: mysql_user }
+            "%mysql_user_password%": { get_param: mysql_user_password }
+            "%mysql_database": { get_param: mysql_database }
+            "%mysql_host": { get_attr: [ database, first_address ] }
           template: |
             #!/bin/bash
 
@@ -103,22 +213,13 @@ resources:
             define('DB_NAME', '%mysql_database%');
             define('DB_USER', '%mysql_user%');
             define('DB_PASSWORD', '%mysql_user_password%');
-            define('DB_HOST', 'localhost');
+            define('DB_HOST', '%mysql_host%');
             define('DB_CHARSET', 'utf8');
             define('DB_COLLATE', '');
             if ( !defined('ABSPATH') )
             define('ABSPATH', dirname(__FILE__) . '/');
               require_once(ABSPATH . 'wp-settings.php');
             EOF
-
-            echo "Installing and configuring MySQL..."
-            echo "###################################"
-            echo ""
-            export DEBIAN_FRONTEND=noninteractive
-            apt-get -q -y install mysql-server
-            mysql -e "UPDATE mysql.user SET Password=PASSWORD('%mysql_password%') WHERE User='root'; FLUSH PRIVILEGES"
-            mysql -p%mysql_password% -e "CREATE DATABASE %mysql_database%"
-            mysql -p%mysql_password% -e "GRANT ALL PRIVILEGES ON %mysql_database%.* TO '%mysql_user%'@'localhost' IDENTIFIED BY '%mysql_user_password%'; FLUSH PRIVILEGES"
 
             echo "Configuring Apache..."
             echo "#####################"
