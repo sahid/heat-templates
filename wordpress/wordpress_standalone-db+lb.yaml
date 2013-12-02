@@ -1,0 +1,290 @@
+#   Copyright 2013 Cloudwatt 
+#   
+#   Author: Sahid Orentino Ferdjaoui <sahid.ferdjaoui@cloudwatt.com>
+#
+#   Licensed under the Apache License, Version 2.0 (the "License"); you may
+#   not use this file except in compliance with the License. You may obtain
+#   a copy of the License at
+#
+#        http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#   WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+#   License for the specific language governing permissions and limitations
+#   under the License.
+#
+
+heat_template_version: 2013-11-29
+
+description: >-
+  Setup a WordPress in standalone database with autoscaling
+  Note:
+    - There is no way to associate floating ip and vip bug/1256836.
+    - This template is used with deb packages.
+    
+
+parameters:
+  key_name:
+    type: string
+    description: Name of a KeyPair to enable SSH access to the instance.
+  instance_appserver_type:
+    type: string
+    description: Appserver instance type for WordPress server.
+    default: m1.small
+  instance_database_type:
+    type: string
+    description: Database instance type for WordPress server.
+    default: m2.medium
+  image_id:
+    type: string
+    description: ID of the image to use for the WordPress server.
+    default: Ubuntu 12.04.3 x86_64
+  public_net_id:
+    type: string
+    description: Public network for which floating IP addresses will be allocated.
+    default: 17ef688d-d903-48d5-8ddc-b8a8ae213346
+
+  mysql_password:
+    type: string
+    description: Configures a root password of MySQL.
+    default: Cl0udWatt
+  mysql_user:
+    type: string
+    description: Configures a MySQL user for WordPress.
+
+    default: wordpress_user
+  mysql_user_password:
+    type: string
+    description: Configures a MySQL password user for WordPress.
+    default: Cl0udWatt+User
+  mysql_database:
+    type: string
+    description: Configures a MySQL database name for WordPress.
+    default: wordpress_db
+  mysql_host:
+    type: string
+    description: Configures a MySQL server host.
+    default: 0.0.0.0
+
+resources:
+  secgroup-http:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      description: Enable traffic external traffic on HTTP-80
+      rules: [{protocol: tcp, port_range_max: 65535, port_range_min: 1},]
+
+  secgroup-ssh:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      description: Enable traffic external traffic on SSH.
+      rules: [{protocol: tcp, port_range_max: 22, port_range_min: 22},]
+
+  secgroup-internal:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      description: Enable all traffic between instances.
+      rules: [{protocol: tcp, port_range_max: 65535, port_range_min: 1, remote_mode: remote_group_id},]
+
+# Networks
+
+  private_net:
+    type: OS::Neutron::Net
+
+  private_subnet:
+    type: OS::Neutron::Subnet
+    properties:
+      network_id: { get_resource: private_net }
+      cidr: 10.123.0.0/24
+
+# Router
+
+  router:
+    type: OS::Neutron::Router
+
+  router_gateway:
+    type: OS::Neutron::RouterGateway
+    properties:
+      router_id: { get_resource: router }
+      network_id: { get_param: public_net_id }
+
+  router_interface:
+    type: OS::Neutron::RouterInterface
+    properties:
+      router_id: { get_resource: router }
+      subnet_id: { get_resource: private_subnet }
+
+# Ports
+
+  database_port:
+    type: OS::Neutron::Port
+    properties:
+      security_groups: [{get_resource: secgroup-ssh}, {get_resource: secgroup-internal}]
+      network_id: { get_resource: private_net }
+      fixed_ips:
+        - subnet_id: { get_resource: private_subnet }
+
+  appserver_port:
+    type: OS::Neutron::Port
+    properties:
+      security_groups: [{get_resource: secgroup-ssh}, {get_resource: secgroup-internal}]
+      network_id: { get_resource: private_net }
+      fixed_ips:
+        - subnet_id: { get_resource: private_subnet }
+
+  lb:
+    type: OS::Neutron::LoadBalancer
+    properties:
+      members: [ {get_resource: appserver} ]
+      pool_id: {get_resource: lb_pool}
+      protocol_port: 8080
+
+  lb_monitor:
+    type: OS::Neutron::HealthMonitor
+    properties:
+      delay: 3
+      max_retries: 3
+      timeout: 3
+      type: HTTP
+
+  lb_pool:
+    type: OS::Neutron::Pool
+    properties:
+      lb_method: ROUND_ROBIN
+      monitors: [{get_resource: lb_monitor}]
+      protocol: HTTP
+      subnet_id: {get_resource: private_subnet}
+      vip: {"address": 10.123.0.111, "protocol_port": 80}
+
+  floating:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network_id: { get_param: public_net_id }
+
+# Servers
+
+  appserver_group:
+    type: OS::Heat::InstanceGroup
+    properties:
+      AvailabilityZones: []
+      LaunchConfigurationName: {get_resource: appserver_config}
+      LoadBalancerNames: [{get_resource: lb}]
+      Size: 2   
+
+  appserver_config:
+    type: AWS::AutoScaling::LaunchConfiguration
+    properties:
+      ImageId: { get_param: image_id }
+      InstanceType: { get_param: instance_appserver_type }
+      KeyName: { get_param: key_name }
+      Networks: [{get_resource: appserver_port}]
+
+  database:
+    type: OS::Nova::Server
+    properties:
+      image: { get_param: image_id }
+      flavor: { get_param: instance_database_type }
+      key_name: { get_param: key_name }
+      networks:
+        - port: { get_resource: database_port }
+      user_data_format: RAW
+      user_data:
+        str_replace:
+          params:
+            "%mysql_password%": { get_param: mysql_password }
+            "%mysql_user%": { get_param: mysql_user }
+            "%mysql_user_password%": { get_param: mysql_user_password }
+            "%mysql_database%": { get_param: mysql_database }
+            "%mysql_host%": { get_param: mysql_host }
+          template: |
+            #!/bin/bash
+
+            echo "Preparing the instance to be ready to run with Heat..."
+            echo "######################################################"
+            echo ""
+            apt-get update; apt-get install -y git python-setuptools
+            apt-get -y install python-argparse cloud-init python-psutil python-pip
+            apt-get -y remove python-boto
+            pip install 'boto==2.5.2' heat-cfntools
+            cfn-create-aws-symlinks -s /usr/local/bin/
+
+            echo "Installing and configuring MySQL..."
+            echo "###################################"
+            echo ""
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get -q -y install mysql-server
+            mysql -e "UPDATE mysql.user SET Password=PASSWORD('%mysql_password%') WHERE User='root'; FLUSH PRIVILEGES"
+            mysql -p%mysql_password% -e "CREATE DATABASE %mysql_database%"
+            mysql -p%mysql_password% -e "GRANT ALL PRIVILEGES ON %mysql_database%.* TO '%mysql_user%' IDENTIFIED BY '%mysql_user_password%'; FLUSH PRIVILEGES"
+            sed -i 's/127.0.0.1/%mysql_host%/g' /etc/mysql/my.cnf
+            service mysql restart
+
+  appserver:
+    type: OS::Nova::Server
+    properties:
+      image: { get_param: image_id }
+      flavor: { get_param: instance_appserver_type }
+      key_name: { get_param: key_name }
+      networks:
+        - port: { get_resource: appserver_port }
+      user_data_format: RAW
+      user_data:
+        str_replace:
+          params:
+            "%mysql_password%": { get_param: mysql_password }
+            "%mysql_user%": { get_param: mysql_user }
+            "%mysql_user_password%": { get_param: mysql_user_password }
+            "%mysql_database%": { get_param: mysql_database }
+            "%mysql_host%": { get_attr: [ database, first_address ] }
+          template: |
+            #!/bin/bash
+
+            echo "Preparing the instance to be ready to run with Heat..."
+            echo "######################################################"
+            echo ""
+            apt-get update; apt-get install -y git python-setuptools
+            apt-get -y install python-argparse cloud-init python-psutil python-pip
+            apt-get -y remove python-boto
+            pip install 'boto==2.5.2' heat-cfntools
+            cfn-create-aws-symlinks -s /usr/local/bin/
+
+            echo "Installing and configuring WordPress..."
+            echo "#######################################"
+            echo ""
+            apt-get install -y wordpress
+            chown -R www-data /usr/share/wordpress
+            ln -s /usr/share/wordpress /var/www/wordpress
+            cat > /etc/wordpress/wp-config.php <<EOF
+            <?php
+            define('DB_NAME', '%mysql_database%');
+            define('DB_USER', '%mysql_user%');
+            define('DB_PASSWORD', '%mysql_user_password%');
+            define('DB_HOST', '%mysql_host%');
+            define('DB_CHARSET', 'utf8');
+            define('DB_COLLATE', '');
+            if ( !defined('ABSPATH') )
+            define('ABSPATH', dirname(__FILE__) . '/');
+              require_once(ABSPATH . 'wp-settings.php');
+            EOF
+
+            echo "Configuring Apache..."
+            echo "#####################"
+            echo ""
+            cat > /etc/apache2/sites-available/wordpress <<EOF
+            <VirtualHost *:8080>
+            ServerName wordpress
+            ServerAdmin server@admin
+            DocumentRoot /var/www/wordpress/
+            <Directory />
+            Options FollowSymLinks
+            AllowOverride All
+            </Directory>
+            ErrorLog /var/log/apache2/error.log
+            CustomLog /var/log/apache2/access.log combined
+            LogLevel warn
+            </VirtualHost>
+            EOF
+            sed 's/80/8080/g' -i /etc/apache2/ports.conf
+            a2dissite default
+            a2ensite wordpress
+            service apache2 reload
