@@ -60,6 +60,11 @@ parameters:
     type: string
     description: Configures a MySQL server host.
     default: 0.0.0.0
+  mysql_slave_password:
+    type: string
+    description: Configures a paasword for MySQL slave.
+    default: slavepass
+
 
 resources:
   secgroup-http:
@@ -82,24 +87,14 @@ resources:
 
 # Networks
 
-  database_net:
+  private_net:
     type: OS::Neutron::Net
 
-  database_subnet:
+  private_subnet:
     type: OS::Neutron::Subnet
     properties:
-      network_id: { get_resource: database_net }
+      network_id: { get_resource: private_net }
       cidr: 10.123.0.0/24
-
-  appserver_net:
-    type: OS::Neutron::Net
-
-  appserver_subnet:
-    type: OS::Neutron::Subnet
-    properties:
-      network_id: { get_resource: appserver_net }
-      cidr: 10.123.1.0/24
-
 
 # Router
 
@@ -116,14 +111,7 @@ resources:
     type: OS::Neutron::RouterInterface
     properties:
       router_id: { get_resource: router }
-      subnet_id: { get_resource: database_subnet }
-
-  router_interface:
-    type: OS::Neutron::RouterInterface
-    properties:
-      router_id: { get_resource: router }
-      subnet_id: { get_resource: appserver_subnet }
-
+      subnet_id: { get_resource: private_subnet }
 
 # Ports
 
@@ -131,25 +119,34 @@ resources:
     type: OS::Neutron::Port
     properties:
       security_groups: [{get_resource: secgroup-ssh}, {get_resource: secgroup-internal}]
-      network_id: { get_resource: database_net }
+      network_id: { get_resource: private_net }
       fixed_ips:
-        - subnet_id: { get_resource: database_subnet }
+        - subnet_id: { get_resource: private_subnet }
+
+  database_slave_port:
+    type: OS::Neutron::Port
+    properties:
+      security_groups: [{get_resource: secgroup-ssh}, {get_resource: secgroup-internal}]
+      network_id: { get_resource: private_net }
+      fixed_ips:
+        - subnet_id: { get_resource: private_subnet }
+
 
   appserver_port:
     type: OS::Neutron::Port
     properties:
       security_groups: [{get_resource: secgroup-http}, {get_resource: secgroup-ssh}, {get_resource: secgroup-internal}]
-      network_id: { get_resource: appserver_net }
+      network_id: { get_resource: private_net }
       fixed_ips:
-        - subnet_id: { get_resource: appserver_subnet }
+        - subnet_id: { get_resource: private_subnet }
 
 # Floating iP
 
-#  appserver_floating_ip:
-#    type: OS::Neutron::FloatingIP
-#    properties:
-#      floating_network_id: { get_param: public_net_id }
-#      port_id: { get_resource: vip_port }
+  appserver_floating_ip:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network_id: { get_param: public_net_id }
+      port_id: { get_resource: appserver_port }
 
 # Servers
           
@@ -170,6 +167,7 @@ resources:
             "%mysql_user_password%": { get_param: mysql_user_password }
             "%mysql_database%": { get_param: mysql_database }
             "%mysql_host%": { get_param: mysql_host }
+            "%mysql_slave_password%": { get_param: mysql_slave_password }
           template: |
             #!/bin/bash
 
@@ -188,34 +186,56 @@ resources:
             export DEBIAN_FRONTEND=noninteractive
             apt-get -q -y install mysql-server
             mysql -e "UPDATE mysql.user SET Password=PASSWORD('%mysql_password%') WHERE User='root'; FLUSH PRIVILEGES"
+            mysql -p%mysql_password% -e "CREATE USER 'repl' IDENTIFIED BY '%mysql_slave_password%';"
+            mysql -p%mysql_password% -e "GRANT REPLICATION SLAVE ON *.* TO 'repl'; FLUSH PRIVILEGES"
             mysql -p%mysql_password% -e "CREATE DATABASE %mysql_database%"
             mysql -p%mysql_password% -e "GRANT ALL PRIVILEGES ON %mysql_database%.* TO '%mysql_user%' IDENTIFIED BY '%mysql_user_password%'; FLUSH PRIVILEGES"
             sed -i 's/127.0.0.1/%mysql_host%/g' /etc/mysql/my.cnf
+            sed -i 's/#log_bin/log_bin/g' /etc/mysql/my.cnf
+            sed -i 's/#server-id/server-id/g' /etc/mysql/my.cnf
             service mysql restart
 
-  lb:
-    type: OS::Neutron::LoadBalancer
+  database_slave:
+    type: OS::Nova::Server
     properties:
-      members: [{get_resource: appserver}]
-      pool_id: {get_resource: lb_pool}
-      protocol_port: 8080
-
-  lb_monitor:
-    type: OS::Neutron::HealthMonitor
-    properties:
-      delay: 3
-      max_retries: 3
-      timeout: 3
-      type: HTTP
-
-  lb_pool:
-    type: OS::Neutron::Pool
-    properties:
-      lb_method: ROUND_ROBIN
-      monitors: [{get_resource: lb_monitor}]
-      protocol: HTTP
-      subnet_id: {get_resource: appserver_subnet}
-      vip: {"address": 10.123.1.111, "protocol_port": 80}
+      image: { get_param: image_id }
+      flavor: { get_param: instance_type }
+      key_name: { get_param: key_name }
+      networks:
+        - port: { get_resource: database_slave_port }
+      user_data_format: RAW
+      user_data:
+        str_replace:
+          params:
+            "%mysql_password%": { get_param: mysql_password }
+            "%mysql_user%": { get_param: mysql_user }
+            "%mysql_user_password%": { get_param: mysql_user_password }
+            "%mysql_database%": { get_param: mysql_database }
+            "%mysql_host%": { get_attr: [ database, first_address ] }
+            "%mysql_slave_password%": { get_param: mysql_slave_password }
+          template: |
+            #!/bin/bash
+            
+            echo "Preparing the instance to be ready to run with Heat..."
+            echo "######################################################"
+            echo ""
+            apt-get update; apt-get install -y git python-setuptools
+            apt-get -y install python-argparse cloud-init python-psutil python-pip
+            apt-get -y remove python-boto
+            pip install 'boto==2.5.2' heat-cfntools
+            cfn-create-aws-symlinks -s /usr/local/bin/
+            
+            echo "Installing and configuring MySQL..."
+            echo "###################################"
+            echo ""
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get -q -y install mysql-server
+            mysql -e "UPDATE mysql.user SET Password=PASSWORD('%mysql_password%') WHERE User='root'; FLUSH PRIVILEGES"
+            mysql -p%mysql_password% -e "CREATE DATABASE %mysql_database%"
+            mysql -p%mysql_password% -e "CHANGE MASTER TO MASTER_HOST='%mysql_host%', MASTER_USER='repl', MASTER_PASSWORD='%mysql_slave_password%';"
+            sed -i 's/127.0.0.1/%mysql_host%/g' /etc/mysql/my.cnf
+            sed -i 's/#server-id.*/server-id=2/g' /etc/mysql/my.cnf
+            service mysql restart
 
   appserver:
     type: OS::Nova::Server
@@ -269,7 +289,7 @@ resources:
             echo "#####################"
             echo ""
             cat > /etc/apache2/sites-available/wordpress <<EOF
-            <VirtualHost *:8080>
+            <VirtualHost *:80>
             ServerName wordpress
             ServerAdmin server@admin
             DocumentRoot /var/www/wordpress/
@@ -282,7 +302,6 @@ resources:
             LogLevel warn
             </VirtualHost>
             EOF
-            sed 's/80/8080/g' -i /etc/apache2/ports.conf
             a2dissite default
             a2ensite wordpress
             service apache2 reload
